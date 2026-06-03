@@ -18,6 +18,7 @@ import argparse
 import os
 import pandas as pd
 import logging
+from pathlib import Path
 
 from aiter.fused_moe import (
     fused_topk,
@@ -31,12 +32,12 @@ from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
 import aiter.ops.flydsl.moe_kernels as _aiter_mk
 
-try:
-    from tuned_op_bench_utils import append_tuned_op_bench_rows
-except ModuleNotFoundError as e:
-    if e.name != "tuned_op_bench_utils":
-        raise
-    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
+# try:
+#     from tuned_op_bench_utils import append_tuned_op_bench_rows
+# except ModuleNotFoundError as e:
+#     if e.name != "tuned_op_bench_utils":
+#         raise
+#     from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 
 
 from aiter.ops.shuffle import (
@@ -52,6 +53,68 @@ torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+
+
+def _sanitize_profile_name(name):
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+
+
+def _profiler_table(prof):
+    for sort_key in (
+        "self_cuda_time_total",
+        "self_device_time_total",
+        "cuda_time_total",
+    ):
+        try:
+            return prof.key_averages().table(sort_by=sort_key, row_limit=30)
+        except Exception:
+            continue
+    return prof.key_averages().table(row_limit=30)
+
+
+def _run_torch_profile(
+    label,
+    profile_dir,
+    func,
+    *args,
+    warmup=2,
+    active=5,
+    **kwargs,
+):
+    if not profile_dir:
+        return None
+
+    active = max(int(active), 1)
+    warmup = max(int(warmup), 0)
+    profile_dir = Path(profile_dir)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    for _ in range(warmup):
+        func(*args, **kwargs)
+        torch.cuda.synchronize()
+
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=True,
+    ) as prof:
+        for _ in range(active):
+            with torch.profiler.record_function(label):
+                func(*args, **kwargs)
+            torch.cuda.synchronize()
+
+    trace_path = profile_dir / f"{_sanitize_profile_name(label)}.json"
+    prof.export_chrome_trace(str(trace_path))
+    aiter.logger.info(
+        "torch profiler summary for %s:\n%s", label, _profiler_table(prof)
+    )
+    aiter.logger.info("torch profiler trace saved to %s", trace_path)
+    return trace_path
 
 
 @benchmark()
@@ -75,9 +138,17 @@ def test_fmoe(
     strict_accuracy=True,
     check_aot_cache=True,
     swiglu_limit=0.0,
+    ep=1,
+    torch_profile_dir=None,
+    torch_profile_label=None,
+    torch_profile_warmup=2,
+    torch_profile_iters=5,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+    if ep < 1:
+        raise ValueError(f"ep must be >= 1, got {ep}")
+    global_E = E * ep
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
@@ -98,17 +169,68 @@ def test_fmoe(
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if AITER_MOE_EXPERT_BALANCE:
-        score = torch.zeros((token, E), dtype=dtype)
+        score = torch.zeros((token, global_E), dtype=dtype)
         start_col = 0
         end_col = topk
         for token_id in range(token):
             score[token_id, start_col:end_col] = 1.0
-            start_col = end_col % E
+            start_col = end_col % global_E
             end_col = start_col + topk
     else:
-        score = torch.randn((token, E), dtype=dtype)
+        score = torch.randn((token, global_E), dtype=dtype)
 
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    expert_mask = None
+    num_local_tokens = None
+    ck_input = input
+    ck_topk_weights = topk_weights
+    ck_topk_ids = topk_ids
+    ref_topk_weights = topk_weights
+    ref_topk_ids = topk_ids
+    print("=====before shape of ref_topk_weights", ref_topk_weights.shape)
+    if ep > 1:
+        padded_token = token
+        local_hit = topk_ids < E
+        token_mask = local_hit.any(dim=1)
+        if not token_mask.any():
+            logging.warning(
+                "skip EP case: no tokens routed to rank0 local experts "
+                "(%s global tokens, %s global experts, %s local experts)",
+                token,
+                global_E,
+                E,
+            )
+            return
+        input = input[token_mask]
+        print("=====after shape of input", input.shape)
+        topk_weights = topk_weights[token_mask]
+        topk_ids = topk_ids[token_mask]
+        local_hit = local_hit[token_mask]
+        token = input.shape[0]
+        num_local_tokens = torch.tensor(
+            [token], dtype=topk_ids.dtype, device=input.device
+        )
+
+        ref_topk_weights = topk_weights.masked_fill(~local_hit, 0)
+        ref_topk_ids = topk_ids.masked_fill(~local_hit, -1)
+        expert_mask = torch.zeros((global_E,), dtype=dtypes.i32)
+        expert_mask[:E] = 1
+
+        ck_input = torch.zeros(
+            (padded_token, model_dim), dtype=input.dtype, device=input.device
+        )
+        ck_input[:token] = input
+        ck_topk_weights = torch.zeros(
+            (padded_token, topk),
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        ck_topk_weights[:token] = topk_weights
+        ck_topk_ids = torch.zeros(
+            (padded_token, topk), dtype=topk_ids.dtype, device=topk_ids.device
+        )
+        ck_topk_ids[:token] = topk_ids
+    print("=====after shape of ref_topk_weights", ref_topk_weights.shape)
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -265,11 +387,11 @@ def test_fmoe(
         and WQDType == dtypes.fp4x2
     ):
         runtime_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
-            token, actType, gateMode, qType, AQDType, WQDType
+            ck_input.shape[0], actType, gateMode, qType, AQDType, WQDType
         )
         if runtime_aq_dtype == dtypes.fp4x2:
             metadata = get_2stage_cfgs(
-                get_padded_M(token),
+                get_padded_M(ck_input.shape[0]),
                 model_dim,
                 inter_dim,
                 E,
@@ -296,8 +418,8 @@ def test_fmoe(
         a1_qt,
         w1_qt,
         w2_qt,
-        topk_weights,
-        topk_ids,
+        ref_topk_weights,
+        ref_topk_ids,
         dtype=stage1_ref_dtype,
         activation=actType,
         quant_type=qType,
@@ -334,8 +456,8 @@ def test_fmoe(
         a2_qt,
         w1_qt,  # E, inter_dim*2, model_dim
         w2_qt,  # E, model_dim, inter_dim
-        topk_weights,
-        topk_ids,
+        ref_topk_weights,
+        ref_topk_ids,
         dtype=dtype,
         quant_type=qType,
         w2_scale=w2_scale,
@@ -345,13 +467,16 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    out2_ck, us2 = run_perftest(
-        fused_moe,
-        input,
+    fused_moe_args = (
+        ck_input,
         w1_qt_aiter,
         w2_qt_aiter,
-        topk_weights,
-        topk_ids,
+        ck_topk_weights,
+        ck_topk_ids,
+    )
+    fused_moe_kwargs = dict(
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
         w1_scale=w1_scale_aiter,
         w2_scale=w2_scale_aiter,
         quant_type=qType,
@@ -363,12 +488,35 @@ def test_fmoe(
         bias2=exp_bias2_aiter,
         swiglu_limit=swiglu_limit,
         gate_mode=gateMode,
+    )
+
+    out2_ck, us2 = run_perftest(
+        fused_moe,
+        *fused_moe_args,
         num_iters=5,
         num_warmup=2,
+        **fused_moe_kwargs,
+    )
+    if torch_profile_dir:
+        label = torch_profile_label or (
+            f"moe_2stage_t{token}_h{model_dim}_i{inter_dim}_e{E}"
+            f"_ep{ep}_k{topk}"
+        )
+        _run_torch_profile(
+            label,
+            torch_profile_dir,
+            fused_moe,
+            *fused_moe_args,
+            warmup=torch_profile_warmup,
+            active=torch_profile_iters,
+            **fused_moe_kwargs,
+        )
+    out2_ck_valid = (
+        out2_ck[: num_local_tokens.item()] if num_local_tokens is not None else out2_ck
     )
     err = checkAllclose(
         out2_ref,
-        out2_ck,
+        out2_ck_valid,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
@@ -378,7 +526,7 @@ def test_fmoe(
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
 
-    logits_diff = calc_diff(out2_ref, out2_ck)
+    logits_diff = calc_diff(out2_ref, out2_ck_valid)
     if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
@@ -503,8 +651,16 @@ parser.add_argument(
     "--expert",
     type=int,
     default=257,
-    help="""Number of experts.
+    help="""Number of local experts.
     e.g.: -e 8""",
+)
+parser.add_argument(
+    "--ep",
+    type=int,
+    default=1,
+    help="""Expert parallel size. With EP > 1, routing is generated over
+    expert * ep global experts while this script simulates rank0.
+    e.g.: --ep 8""",
 )
 
 parser.add_argument(
@@ -552,6 +708,36 @@ parser.add_argument(
     default=0.0,
     help="Limit the number of experts for swiglu activation type. Default is 0.0.",
 )
+parser.add_argument(
+    "--torch-profile",
+    dest="torch_profile",
+    type=str,
+    default=None,
+    metavar="DIR",
+    help="""Enable torch.profiler for fused_moe and write Chrome trace json to DIR.
+    e.g.: --torch-profile ./moe_2stage_traces""",
+)
+parser.add_argument(
+    "--torch-profile-warmup",
+    type=int,
+    default=2,
+    help="""torch profiler warmup iterations. Default: 2.
+    e.g.: --torch-profile-warmup 3""",
+)
+parser.add_argument(
+    "--torch-profile-iters",
+    type=int,
+    default=5,
+    help="""torch profiler active iterations. Default: 5.
+    e.g.: --torch-profile-iters 5""",
+)
+parser.add_argument(
+    "--torch-profile-max-cases",
+    type=int,
+    default=1,
+    help="""Maximum number of executed cases to trace. Use 0 to trace all cases.
+    Default: 1.""",
+)
 
 args = parser.parse_args()
 
@@ -589,6 +775,30 @@ def _str2enum(s, enum_cls):
     return getattr(enum_cls, s.strip().split(".")[-1])
 
 
+def _profile_value_name(value):
+    name = getattr(value, "name", None)
+    if name is not None:
+        return str(name)
+    return str(value).replace("torch.", "").replace("aiter.", "")
+
+
+def _profile_case_label(case_idx, kwargs):
+    return (
+        f"moe_2stage_case{case_idx}"
+        f"_t{kwargs['token']}"
+        f"_h{kwargs['model_dim']}"
+        f"_i{kwargs['inter_dim']}"
+        f"_e{kwargs['E']}"
+        f"_ep{kwargs['ep']}"
+        f"_k{kwargs['topk']}"
+        f"_{_profile_value_name(kwargs['dtype'])}"
+        f"_{_profile_value_name(kwargs['actType'])}"
+        f"_{_profile_value_name(kwargs['qType'])}"
+        f"_a{_profile_value_name(kwargs['AQDType'])}"
+        f"_w{_profile_value_name(kwargs['WQDType'])}"
+    )
+
+
 def _row_to_kwargs(row):
     # csv rows store already-effective dims, so pad defaults to 0.
     q_type = _str2enum(row["q_type"], aiter.QuantType)
@@ -615,6 +825,7 @@ def _row_to_kwargs(row):
         hidden_pad=0,
         intermediate_pad=0,
         preshuffle=True,
+        ep=1,
     )
 
 
@@ -741,6 +952,7 @@ def _iter_legacy_cases():
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
+            ep=args.ep,
             **over,
         )
 
@@ -849,8 +1061,12 @@ def _write_bench_csv(rows):
 
 df = []
 seen = 0
+profiled = 0
 for kwargs, extras in case_iter:
     seen += 1
+    profile_this_case = bool(args.torch_profile) and (
+        args.torch_profile_max_cases <= 0 or profiled < args.torch_profile_max_cases
+    )
     swiglu_limit = _effective_swiglu_limit(
         kwargs["qType"],
         kwargs["AQDType"],
@@ -871,7 +1087,19 @@ for kwargs, extras in case_iter:
             if kwargs.get("check_aot_cache", False)
             else test_fmoe
         )
-        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        profile_kwargs = {}
+        if profile_this_case:
+            profile_kwargs = dict(
+                torch_profile_dir=args.torch_profile,
+                torch_profile_label=_profile_case_label(seen, kwargs),
+                torch_profile_warmup=args.torch_profile_warmup,
+                torch_profile_iters=args.torch_profile_iters,
+            )
+        ret = run_test_fmoe(
+            **kwargs,
+            swiglu_limit=swiglu_limit,
+            **profile_kwargs,
+        )
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
@@ -880,9 +1108,11 @@ for kwargs, extras in case_iter:
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
     if ret is None:
         continue
+    if profile_this_case:
+        profiled += 1
     ret.update(extras)
     df.append(ret)
-    _write_bench_csv(df)
+    # _write_bench_csv(df)
 
 aiter.logger.info(
     "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",

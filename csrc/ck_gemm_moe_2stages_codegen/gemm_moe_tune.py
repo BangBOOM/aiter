@@ -160,6 +160,18 @@ class FmoeTuner(TunerCommon):
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
 
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        df = super().get_untuned_gemm_list(untuned_gemm_file)
+        if "ep" not in df.columns:
+            df["ep"] = 1
+        return df
+
+    def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
+        df = super().get_tuned_gemm_list(tuned_gemm_file, columns)
+        if "ep" not in df.columns:
+            df["ep"] = 1
+        return df
+
     @staticmethod
     def weight_quant(
         weight,
@@ -736,6 +748,7 @@ class FmoeTuner(TunerCommon):
         model_dim,
         inter_dim,
         expert,
+        ep,
         topk,
         dtype,
         q_dtype_a,
@@ -746,6 +759,9 @@ class FmoeTuner(TunerCommon):
         device="cuda",
     ):
         torch.manual_seed(0)
+        if ep < 1:
+            raise ValueError(f"ep must be >= 1, got {ep}")
+        global_expert = expert * ep
         input = torch.randn((token, model_dim), dtype=dtype) / 10
         if use_g1u1:
             w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
@@ -761,16 +777,37 @@ class FmoeTuner(TunerCommon):
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
         if TUNE_MOE_EXPERT_BALANCE:
-            score = torch.zeros((token, expert), dtype=dtype)
+            score = torch.zeros((token, global_expert), dtype=dtype)
             start_col = 0
             end_col = topk
             for token_id in range(token):
                 score[token_id, start_col:end_col] = 1.0
-                start_col = end_col % expert
+                start_col = end_col % global_expert
                 end_col = start_col + topk
         else:
-            score = torch.randn((token, expert), dtype=dtype)
+            score = torch.randn((token, global_expert), dtype=dtype)
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
+        expert_mask = None
+        ref_topk_weights = topk_weights
+        ref_topk_ids = topk_ids
+        if ep > 1:
+            local_hit = topk_ids < expert
+            token_mask = local_hit.any(dim=1)
+            if not token_mask.any():
+                raise RuntimeError(
+                    "no tokens routed to rank0 local experts "
+                    f"({token} global tokens, {global_expert} global experts, "
+                    f"{expert} local experts)"
+                )
+            input = input[token_mask]
+            topk_weights = topk_weights[token_mask]
+            topk_ids = topk_ids[token_mask]
+            local_hit = local_hit[token_mask]
+            token = input.shape[0]
+            ref_topk_weights = topk_weights.masked_fill(~local_hit, 0)
+            ref_topk_ids = topk_ids.masked_fill(~local_hit, -1)
+            expert_mask = torch.zeros((global_expert,), dtype=dtypes.i32)
+            expert_mask[:expert] = 1
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
                 input.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -799,7 +836,15 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle = w2_qt
 
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-            moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
+            moe_sorting(
+                topk_ids,
+                topk_weights,
+                global_expert,
+                model_dim,
+                dtype,
+                blockM,
+                expert_mask,
+            )
         )
         needed = sorted_expert_ids.shape[0] * blockM
         if sorted_ids.shape[0] < needed:
@@ -831,8 +876,11 @@ class FmoeTuner(TunerCommon):
             "sorted_weights": sorted_weights,
             "sorted_expert_ids": sorted_expert_ids,
             "num_valid_ids": num_valid_ids,
-            "topk_ids": topk_ids,
-            "topk_weights": topk_weights,
+            "topk_ids": ref_topk_ids,
+            "topk_weights": ref_topk_weights,
+            "global_expert": global_expert,
+            "expert_mask": expert_mask,
+            "ep": ep,
             "moe_buf": moe_buf,
             "a1_scale": a1_scale,
             "w1_scale": w1_scale,
@@ -845,6 +893,7 @@ class FmoeTuner(TunerCommon):
         model_dim,
         inter_dim,
         expert,
+        ep,
         topk,
         act_type,
         dtype,
@@ -861,6 +910,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             dtype,
             q_dtype_a,
@@ -921,6 +971,7 @@ class FmoeTuner(TunerCommon):
         model_dim,
         inter_dim,
         expert,
+        ep,
         topk,
         act_type,
         dtype,
@@ -938,6 +989,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             dtype,
             q_dtype_a,
@@ -1195,6 +1247,7 @@ class FmoeTuner(TunerCommon):
         model_dim,
         inter_dim,
         expert,
+        ep,
         topk,
         act_type,
         dtype,
@@ -1210,6 +1263,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             dtype,
             q_dtype_a,
@@ -1717,6 +1771,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -1827,6 +1882,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -1893,6 +1949,7 @@ class FmoeTuner(TunerCommon):
                             model_dim,
                             inter_dim,
                             expert,
+                            ep,
                             topk,
                             act_type,
                             dtype,
@@ -2010,6 +2067,7 @@ class FmoeTuner(TunerCommon):
                                 model_dim,
                                 inter_dim,
                                 expert,
+                                ep,
                                 topk,
                                 act_type,
                                 dtype,
@@ -2079,6 +2137,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -2122,6 +2181,7 @@ class FmoeTuner(TunerCommon):
                                 model_dim,
                                 inter_dim,
                                 expert,
+                                ep,
                                 topk,
                                 act_type,
                                 dtype,
@@ -2190,6 +2250,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -2281,6 +2342,7 @@ class FmoeTuner(TunerCommon):
                                 model_dim,
                                 inter_dim,
                                 expert,
+                                ep,
                                 topk,
                                 act_type,
                                 dtype,
@@ -2369,6 +2431,7 @@ class FmoeTuner(TunerCommon):
                                 model_dim,
                                 inter_dim,
                                 expert,
+                                ep,
                                 topk,
                                 act_type,
                                 dtype,
@@ -2421,6 +2484,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -2436,6 +2500,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -2450,6 +2515,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -2580,6 +2646,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -2691,6 +2758,7 @@ class FmoeTuner(TunerCommon):
                                 model_dim,
                                 inter_dim,
                                 expert,
+                                ep,
                                 topk,
                                 act_type,
                                 dtype,
@@ -2790,6 +2858,7 @@ class FmoeTuner(TunerCommon):
                             model_dim,
                             inter_dim,
                             expert,
+                            ep,
                             topk,
                             act_type,
                             dtype,
@@ -2845,6 +2914,7 @@ class FmoeTuner(TunerCommon):
             model_dim,
             inter_dim,
             expert,
+            ep,
             topk,
             act_type,
             dtype,
@@ -2921,6 +2991,7 @@ class FmoeTuner(TunerCommon):
                             model_dim,
                             inter_dim,
                             expert,
+                            ep,
                             topk,
                             act_type,
                             dtype,
@@ -3024,6 +3095,7 @@ class FmoeTuner(TunerCommon):
                             model_dim,
                             inter_dim,
                             expert,
+                            ep,
                             topk,
                             act_type,
                             dtype,
@@ -3081,6 +3153,10 @@ class FmoeTuner(TunerCommon):
             model_dim = int(row["model_dim"])
             inter_dim = int(row["inter_dim"])
             expert = int(row["expert"])
+            ep = int(row["ep"]) if "ep" in row and pd.notna(row["ep"]) else 1
+            if ep < 1:
+                raise ValueError(f"ep must be >= 1, got {ep}")
+            global_expert = expert * ep
             topk = int(row["topk"])
             act_type = eval(row["act_type"])
             dtype = eval(row["dtype"])
@@ -3091,7 +3167,7 @@ class FmoeTuner(TunerCommon):
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
             shape_str = (
-                f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
+                f"({token}, {model_dim}, {inter_dim}, E={expert}, ep={ep}, topk={topk}, "
                 f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
                 f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
                 f"dw_s1={doweight_stage1})"
@@ -3222,8 +3298,57 @@ class FmoeTuner(TunerCommon):
                 w1_qt_fmoe.is_shuffled = True
                 w2_qt_fmoe.is_shuffled = True
 
-                score = torch.randn((token, expert), dtype=dtype, device="cuda")
+                score = torch.randn((token, global_expert), dtype=dtype, device="cuda")
                 topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
+                expert_mask = None
+                num_local_tokens = None
+                ck_hidden = hidden
+                ck_topk_weights = topk_weights
+                ck_topk_ids = topk_ids
+                ref_topk_weights = topk_weights
+                ref_topk_ids = topk_ids
+                if ep > 1:
+                    padded_token = token
+                    local_hit = topk_ids < expert
+                    token_mask = local_hit.any(dim=1)
+                    if not token_mask.any():
+                        raise RuntimeError(
+                            "no tokens routed to rank0 local experts "
+                            f"({token} global tokens, {global_expert} global experts, "
+                            f"{expert} local experts)"
+                        )
+                    hidden = hidden[token_mask]
+                    topk_weights = topk_weights[token_mask]
+                    topk_ids = topk_ids[token_mask]
+                    local_hit = local_hit[token_mask]
+                    token = hidden.shape[0]
+                    num_local_tokens = torch.tensor(
+                        [token], dtype=topk_ids.dtype, device=hidden.device
+                    )
+                    ref_topk_weights = topk_weights.masked_fill(~local_hit, 0)
+                    ref_topk_ids = topk_ids.masked_fill(~local_hit, -1)
+                    expert_mask = torch.zeros(
+                        (global_expert,), dtype=dtypes.i32, device=hidden.device
+                    )
+                    expert_mask[:expert] = 1
+                    ck_hidden = torch.zeros(
+                        (padded_token, model_dim),
+                        dtype=hidden.dtype,
+                        device=hidden.device,
+                    )
+                    ck_hidden[:token] = hidden
+                    ck_topk_weights = torch.zeros(
+                        (padded_token, topk),
+                        dtype=topk_weights.dtype,
+                        device=topk_weights.device,
+                    )
+                    ck_topk_weights[:token] = topk_weights
+                    ck_topk_ids = torch.zeros(
+                        (padded_token, topk),
+                        dtype=topk_ids.dtype,
+                        device=topk_ids.device,
+                    )
+                    ck_topk_ids[:token] = topk_ids
                 if q_type == QuantType.per_1x128:
                     a1_qt, a1_scale = aiter.pertoken_quant(
                         hidden.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -3246,11 +3371,13 @@ class FmoeTuner(TunerCommon):
 
                 out, us = run_perftest(
                     fused_moe,
-                    hidden,
+                    ck_hidden,
                     w1_qt_fmoe,
                     w2_qt_fmoe,
-                    topk_weights,
-                    topk_ids,
+                    ck_topk_weights,
+                    ck_topk_ids,
+                    expert_mask=expert_mask,
+                    num_local_tokens=num_local_tokens,
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
@@ -3264,8 +3391,8 @@ class FmoeTuner(TunerCommon):
                     a1_qt,
                     w1_qt,
                     w2_qt,
-                    topk_weights,
-                    topk_ids,
+                    ref_topk_weights,
+                    ref_topk_ids,
                     a1_scale=a1_scale,
                     w1_scale=w1_scale,
                     w2_scale=w2_scale,
@@ -3274,11 +3401,18 @@ class FmoeTuner(TunerCommon):
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
                 )
-                if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                out_valid = (
+                    out[: num_local_tokens.item()]
+                    if num_local_tokens is not None
+                    else out
+                )
+                if out_valid.count_nonzero() == 0 and ref.count_nonzero() > 0:
                     status = "error:output is all zeros (kernel produced no output)"
                     err_ratio = 1.0
                 else:
-                    err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                    err_ratio = checkAllclose(
+                        out_valid, ref, msg=f"run_config {shape_str}"
+                    )
                     if err_ratio <= allowed_err_ratio:
                         status = "ok"
                     else:
@@ -3369,6 +3503,7 @@ class FmoeTuner(TunerCommon):
                 model_dim,
                 inter_dim,
                 expert,
+                ep,
                 topk,
                 act_type,
                 dtype,
@@ -3383,6 +3518,7 @@ class FmoeTuner(TunerCommon):
             q_dtype_w = eval(q_dtype_w)
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
+            ep = int(ep)
             print("\nStart tuning", line)
             if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
                 print(f"{q_type} is not supported on {get_gfx()}")
@@ -3397,6 +3533,7 @@ class FmoeTuner(TunerCommon):
                 model_dim,
                 inter_dim,
                 expert,
+                ep,
                 topk,
                 act_type,
                 dtype,
@@ -3466,10 +3603,12 @@ class FmoeTuner(TunerCommon):
 
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
+        if "ep" not in old_tunedf.columns:
+            old_tunedf["ep"] = 1
 
         for col in self.columns:
             if col not in old_tunedf.columns:
-                old_tunedf[col] = 0
+                old_tunedf[col] = 1 if col == "ep" else 0
 
         new_fallbacks = getattr(self, "_flydsl_fallbacks", [])
         new_fb_keys = set()
@@ -3542,6 +3681,7 @@ class FmoeTuner(TunerCommon):
                 model_dim,
                 inter_dim,
                 expert,
+                ep,
                 topk,
                 act_type,
                 dtype,
@@ -3573,6 +3713,7 @@ class FmoeTuner(TunerCommon):
                         model_dim,
                         inter_dim,
                         expert,
+                        ep,
                         topk,
                         act_type,
                         dtype,
@@ -3695,6 +3836,7 @@ class FmoeTuner(TunerCommon):
                     "model_dim",
                     "inter_dim",
                     "expert",
+                    "ep",
                     "topk",
                     "act_type",
                     "dtype",
@@ -3723,6 +3865,7 @@ class FmoeTuner(TunerCommon):
                         model_dim,
                         inter_dim,
                         expert,
+                        ep,
                         topk,
                         act_type,
                         dtype,
@@ -3939,6 +4082,7 @@ class FmoeTuner(TunerCommon):
                         model_dim,
                         inter_dim,
                         expert,
+                        ep,
                         topk,
                         act_type,
                         dtype,
@@ -4199,13 +4343,19 @@ class FmoeTuner(TunerCommon):
     def pre_process(self, args):
         if args.all:
             self.get_retune_gemm_list(args)
+            if "ep" not in self.untunedf.columns:
+                self.untunedf["ep"] = 1
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
+            if "ep" not in self.untunedf.columns:
+                self.untunedf["ep"] = 1
 
             if not args.all or args.last:
                 self.tunedf = self.get_tuned_gemm_list(
                     self.get_out_file(args.tune_file)
                 )
+                if self.tunedf is not None and "ep" not in self.tunedf.columns:
+                    self.tunedf["ep"] = 1
             else:
                 self.tunedf = None
             self.untunedf["cu_num"] = self.get_cu_num()
@@ -4227,6 +4377,7 @@ if __name__ == "__main__":
         "model_dim",
         "inter_dim",
         "expert",
+        "ep",
         "topk",
         "act_type",
         "dtype",
