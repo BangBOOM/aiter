@@ -129,6 +129,8 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
 
 
 class FmoeTuner(TunerCommon):
+    _ERR_RATIO_MARGIN = getattr(TunerCommon, "_ERR_RATIO_MARGIN", 0.05)
+
     ARG_DEFAULTS = {
         **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
@@ -171,6 +173,58 @@ class FmoeTuner(TunerCommon):
         if "ep" not in df.columns:
             df["ep"] = 1
         return df
+
+    def _get_run_config_err_ratio_limit(self, row, args):
+        base_impl = getattr(super(), "_get_run_config_err_ratio_limit", None)
+        if base_impl is not None:
+            return base_impl(row, args)
+
+        default_limit = float(
+            getattr(args, "errRatio", self.ARG_DEFAULTS.get("errRatio", 0.05))
+        )
+        default_desc = f"--errRatio={default_limit:.6g}"
+        if row is None or not hasattr(row, "get"):
+            return default_limit, default_desc
+
+        csv_label = None
+        csv_value = None
+        for column in ("errRatio", "err_ratio", "err"):
+            value = row.get(column, None)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            if not pd.notna(value):
+                continue
+            try:
+                csv_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            csv_label = f"csv {column}"
+            break
+
+        if csv_value is None:
+            stage_limits = []
+            for column in ("err1", "err2"):
+                value = row.get(column, None)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    continue
+                if not pd.notna(value):
+                    continue
+                try:
+                    stage_limits.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            if stage_limits:
+                csv_value = max(stage_limits)
+                csv_label = "csv max(err1,err2)"
+
+        if csv_value is None:
+            return default_limit, default_desc
+
+        csv_with_margin = csv_value + self._ERR_RATIO_MARGIN
+        csv_part = f"{csv_label}={csv_value:.6g}+{self._ERR_RATIO_MARGIN:.0%}margin"
+        if csv_with_margin > default_limit:
+            return csv_with_margin, f"{csv_part}={csv_with_margin:.6g}"
+        return default_limit, f"{default_desc}, {csv_part} baseline"
 
     @staticmethod
     def weight_quant(
