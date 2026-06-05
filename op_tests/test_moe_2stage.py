@@ -188,6 +188,7 @@ def test_fmoe(
     ref_topk_weights = topk_weights
     ref_topk_ids = topk_ids
     print("=====before shape of ref_topk_weights", ref_topk_weights.shape)
+    expected_m = None
     if ep > 1:
         padded_token = token
         local_hit = topk_ids < E
@@ -203,6 +204,7 @@ def test_fmoe(
             return
         input = input[token_mask]
         print("=====after shape of input", input.shape)
+        expected_m = input.shape[0]
         topk_weights = topk_weights[token_mask]
         topk_ids = topk_ids[token_mask]
         local_hit = local_hit[token_mask]
@@ -488,6 +490,7 @@ def test_fmoe(
         bias2=exp_bias2_aiter,
         swiglu_limit=swiglu_limit,
         gate_mode=gateMode,
+        expected_m=expected_m,
     )
 
     out2_ck, us2 = run_perftest(

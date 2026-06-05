@@ -129,8 +129,6 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
 
 
 class FmoeTuner(TunerCommon):
-    _ERR_RATIO_MARGIN = getattr(TunerCommon, "_ERR_RATIO_MARGIN", 0.05)
-
     ARG_DEFAULTS = {
         **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
@@ -173,58 +171,6 @@ class FmoeTuner(TunerCommon):
         if "ep" not in df.columns:
             df["ep"] = 1
         return df
-
-    def _get_run_config_err_ratio_limit(self, row, args):
-        base_impl = getattr(super(), "_get_run_config_err_ratio_limit", None)
-        if base_impl is not None:
-            return base_impl(row, args)
-
-        default_limit = float(
-            getattr(args, "errRatio", self.ARG_DEFAULTS.get("errRatio", 0.05))
-        )
-        default_desc = f"--errRatio={default_limit:.6g}"
-        if row is None or not hasattr(row, "get"):
-            return default_limit, default_desc
-
-        csv_label = None
-        csv_value = None
-        for column in ("errRatio", "err_ratio", "err"):
-            value = row.get(column, None)
-            if value is None or (isinstance(value, str) and not value.strip()):
-                continue
-            if not pd.notna(value):
-                continue
-            try:
-                csv_value = float(value)
-            except (TypeError, ValueError):
-                continue
-            csv_label = f"csv {column}"
-            break
-
-        if csv_value is None:
-            stage_limits = []
-            for column in ("err1", "err2"):
-                value = row.get(column, None)
-                if value is None or (isinstance(value, str) and not value.strip()):
-                    continue
-                if not pd.notna(value):
-                    continue
-                try:
-                    stage_limits.append(float(value))
-                except (TypeError, ValueError):
-                    continue
-            if stage_limits:
-                csv_value = max(stage_limits)
-                csv_label = "csv max(err1,err2)"
-
-        if csv_value is None:
-            return default_limit, default_desc
-
-        csv_with_margin = csv_value + self._ERR_RATIO_MARGIN
-        csv_part = f"{csv_label}={csv_value:.6g}+{self._ERR_RATIO_MARGIN:.0%}margin"
-        if csv_with_margin > default_limit:
-            return csv_with_margin, f"{csv_part}={csv_with_margin:.6g}"
-        return default_limit, f"{default_desc}, {csv_part} baseline"
 
     @staticmethod
     def weight_quant(
@@ -305,13 +251,13 @@ class FmoeTuner(TunerCommon):
         is_splitk = q_type == QuantType.per_1x128 and splitk > 1
         if is_splitk:
             sorted_size = min(token_num * topk * blockM, sorted_ids.shape[0])
-            tmp_out = torch.empty(
+            tmp_out = torch.zeros(
                 (sorted_size, w1_qt_shffle_ck.shape[1]),
                 dtype=dtypes.fp32,
                 device=a1_qt.device,
             )
         else:
-            out = torch.empty(
+            out = torch.zeros(
                 (token_num, topk, inter_dim),
                 dtype=dtype,
                 device=a1_qt.device,
@@ -340,7 +286,7 @@ class FmoeTuner(TunerCommon):
         except Exception:
             raise
         if is_splitk:
-            out = torch.empty(
+            out = torch.zeros(
                 (token_num, topk, inter_dim),
                 dtype=dtype,
                 device=a1_qt.device,
@@ -1069,6 +1015,7 @@ class FmoeTuner(TunerCommon):
         a1_scale = _data["a1_scale"]
         w1_scale = _data["w1_scale"]
         w2_scale = _data["w2_scale"]
+        token = a1_qt.shape[0]
         # Pre-bind so branches that skip shuffle_scale_* still reach `is None` below.
         w1_scale_aiter = None
         w2_scale_aiter = None
@@ -1343,6 +1290,7 @@ class FmoeTuner(TunerCommon):
         a1_scale = _data["a1_scale"]
         w1_scale = _data["w1_scale"]
         w2_scale = _data["w2_scale"]
+        token = a1_qt.shape[0]
         a1_scale_t = a1_scale
         if q_type == QuantType.per_1x128:
             a1_scale_t = a1_scale.t().contiguous()
@@ -3338,6 +3286,8 @@ class FmoeTuner(TunerCommon):
                         else None
                     )
                 else:
+                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, layout=(16, 16))
+                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, layout=(16, 16))
                     w1_scale_fmoe = (
                         fp4_utils.e8m0_shuffle(w1_scale)
                         if w1_scale is not None
