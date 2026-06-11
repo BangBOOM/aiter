@@ -76,6 +76,7 @@ def test_fmoe(
     check_aot_cache=True,
     swiglu_limit=0.0,
     ep=1,
+    padded_token=None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -116,7 +117,7 @@ def test_fmoe(
     expert_mask = None
     num_local_tokens = None
     if ep > 1:
-        padded_token = token
+        padded_token = token if padded_token is None else padded_token
         local_hit = topk_ids < E
         token_mask = local_hit.any(dim=1)
         if not token_mask.any():
@@ -132,6 +133,11 @@ def test_fmoe(
         local_topk_weights = topk_weights[token_mask]
         local_topk_ids = topk_ids[token_mask]
         local_token = local_input.shape[0]
+        if padded_token < local_token:
+            raise ValueError(
+                f"padded_token must be >= local token count, "
+                f"got {padded_token=} and {local_token=}"
+            )
         num_local_tokens = torch.tensor(
             [local_token], dtype=topk_ids.dtype, device=input.device
         )
@@ -388,6 +394,7 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
+        expected_m=token,
         expert_mask=expert_mask,
         num_local_tokens=num_local_tokens,
         w1_scale=w1_scale_aiter,
@@ -558,6 +565,16 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--padded-token",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Padded token count for each --tokenNum entry in EP cases.
+    Must have the same length as --tokenNum. Defaults to each tokenNum value.
+    e.g.: -t 128 256 --padded-token 256 512""",
+)
+
+parser.add_argument(
     "-k",
     "--topk",
     type=int,
@@ -605,6 +622,15 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+if args.padded_token is not None:
+    if len(args.padded_token) != len(args.tokenNum):
+        parser.error("--padded-token must have the same length as --tokenNum")
+    if any(padded_token < 1 for padded_token in args.padded_token):
+        parser.error("--padded-token values must be positive")
+else:
+    args.padded_token = list(args.tokenNum)
+
+token_padded_pairs = list(zip(args.tokenNum, args.padded_token))
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
@@ -805,7 +831,7 @@ def _iter_legacy_cases():
 
         if triple == _PER1X32_BF16_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-                for m in args.tokenNum:
+                for m, padded_token in token_padded_pairs:
                     yield _kw(
                         dtype,
                         m,
@@ -818,11 +844,12 @@ def _iter_legacy_cases():
                         aiter.ActivationType.Swiglu,
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
+                        padded_token=padded_token,
                     ), extras
         elif triple == _PER1X32_FP8_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for act_type in args.act:
-                    for m in args.tokenNum:
+                    for m, padded_token in token_padded_pairs:
                         yield _kw(
                             dtype,
                             m,
@@ -835,11 +862,12 @@ def _iter_legacy_cases():
                             act_type,
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
+                            padded_token=padded_token,
                         ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
-                    for m in args.tokenNum:
+                    for m, padded_token in token_padded_pairs:
                         yield _kw(
                             dtype,
                             m,
@@ -853,9 +881,10 @@ def _iter_legacy_cases():
                             preshuffle=preshuffle,
                             hidden_pad=0,
                             intermediate_pad=0,
+                            padded_token=padded_token,
                         ), extras
         elif triple == _PER1X32_BF16_I4:
-            for m in args.tokenNum:
+            for m, padded_token in token_padded_pairs:
                 yield _kw(
                     dtype,
                     m,
@@ -866,10 +895,11 @@ def _iter_legacy_cases():
                     wq_dtype,
                     doweight_stage1,
                     aiter.ActivationType.Silu,
+                    padded_token=padded_token,
                 ), extras
         else:
             for act_type in args.act:
-                for m in args.tokenNum:
+                for m, padded_token in token_padded_pairs:
                     yield _kw(
                         dtype,
                         m,
@@ -880,6 +910,7 @@ def _iter_legacy_cases():
                         wq_dtype,
                         doweight_stage1,
                         act_type,
+                        padded_token=padded_token,
                     ), extras
 
 
